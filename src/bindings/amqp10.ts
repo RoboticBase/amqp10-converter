@@ -1,11 +1,11 @@
 import { readFileSync } from 'fs';
 import { Connection, ConnectionOptions, Receiver, ReceiverOptions, ReceiverEvents, EventContext, Message, SenderOptions } from 'rhea-promise';
 import Ajv from 'ajv';
-import { Liquid, Template } from 'liquidjs';
 import log4js from 'log4js';
 import { sendAttributes } from '@/bindings/iotagent-json';
 import { activate, setCommandResult, deactivate } from '@/bindings/iotagent-lib';
-import { QueueDef, Entity, DeviceMessage, MessageType, JsonType, isObject } from '@/common';
+import { sendNgsiMessage } from '@/bindings/orion';
+import { BackendType, QueueDef, Entity, DeviceMessage, MessageType, JsonType, isObject } from '@/common';
 
 const host = process.env.AMQP_HOST || 'localhost';
 const port = parseInt(process.env.AMQP_PORT || '5672');
@@ -15,7 +15,6 @@ const password = process.env.AMQP_PASSWORD;
 const queueDefsStr = process.env.QUEUE_DEFS || '[{"type":"type0","id":"id0"}]';
 const upstreamDataModel = process.env.UPSTREAM_DATA_MODEL || 'dm-by-entity';
 const schemaPathsStr = process.env.SCHEMA_PATHS || '{}';
-const mappingPathsStr = process.env.MAPPING_PATHS || '{}';
 
 const logger = log4js.getLogger('amqp10');
 
@@ -51,8 +50,8 @@ export class AMQPBase {
       throw new Error(`invalid QUEUE_DEFS (${rawQueueDefs})`);
     }
 
-    this._queueDefs = rawQueueDefs.map((e: {type: string; id: string | undefined; fiwareService: string | undefined; fiwareServicePath: string | undefined}) => {
-      return new QueueDef(e.type, e.id, e.fiwareService, e.fiwareServicePath);
+    this._queueDefs = rawQueueDefs.map((e: {type: string; id: string | undefined; fiwareService: string | undefined; fiwareServicePath: string | undefined, backend: string |undefined}) => {
+      return new QueueDef(e.type, e.id, e.fiwareService, e.fiwareServicePath, e.backend);
     });
   }
 
@@ -75,14 +74,10 @@ export class AMQPBase {
 export class Consumer extends AMQPBase {
   private receivers: Receiver[] = [];
   private validatorPath: {[s: string]: Function[]} | null = null;
-  private engine: Liquid;
-  private mappingPaths: {[s: string]: Template[]} | null = null;
 
   constructor() {
     super();
     this.createValidator();
-    this.engine = new Liquid();
-    this.createMappingPaths();
   }
 
   private createValidator(): void {
@@ -112,25 +107,6 @@ export class Consumer extends AMQPBase {
     }, ['', []])[1] : [];
   }
 
-  private createMappingPaths(): void {
-    try {
-      const rawMappingPaths = JSON.parse(mappingPathsStr);
-      if (!isObject(rawMappingPaths)) {
-        logger.warn(`MAPPING_PATHS (${mappingPathsStr}) is not valid Object`);
-        this.mappingPaths = null;
-        return;
-      }
-      this.mappingPaths = Object.entries(rawMappingPaths).map(([k, v]) => {
-        return [k, this.engine.parseFileSync(v as string)];
-      })
-      .reduce((obj, [k, v]) => ({...obj, [String(k)]:v}), {});
-      logger.info(`create mappingPaths from ${mappingPathsStr}`);
-    } catch (err) {
-      logger.warn('invalid MAPPING_PATHS, so ignore it', err);
-      this.mappingPaths = null;
-    }
-  }
-
   async consume(): Promise<string> {
     const connection = await this.getConnection();
     await this.receive(connection);
@@ -156,9 +132,6 @@ export class Consumer extends AMQPBase {
     const validators: Function[] = this.getValidators(queueDef.upstreamQueue);
     logger.info(`the number of validators (queue=${queueDef.upstreamQueue}) is ${validators.length}`);
 
-    const template = (this.mappingPaths) ? this.mappingPaths[queueDef.upstreamQueue] : undefined;
-    logger.info(`the mapping template of ${queueDef.upstreamQueue} is ${(template) ? 'found' : 'not found'}`);
-
     const receiver = await connection.createReceiver(receiverOptions);
     logger.info(`consume message from Queue: ${queueDef.upstreamQueue}`);
     receiver.on(ReceiverEvents.message, (context: EventContext) => {
@@ -172,37 +145,10 @@ export class Consumer extends AMQPBase {
             logger.warn(`no json schema matched this msg: msg=${msg}, schemas=${schemaPathsStr}`);
             context.delivery?.reject();
           } else {
-            const converted = (template) ? this.engine.renderSync(template, parsed) : msg;
-            logger.debug(`converted message: ${converted.replace(/\r?\n/g, '')}`);
-            const deviceMessage = new DeviceMessage(converted as string);
-            const entity = (upstreamDataModel === 'dm-by-entity-type') ? Entity.fromData(queueDef, deviceMessage.data)
-                                                                       : new Entity(queueDef.type, queueDef.id);
-            switch (deviceMessage.messageType) {
-              case MessageType.attrs:
-                sendAttributes(queueDef, entity, deviceMessage.data)
-                  .then(() => {
-                    logger.debug('sent attributes: %o', deviceMessage.data);
-                    context.delivery?.accept();
-                  })
-                  .catch((err) => {
-                    logger.error('failed sending attributes', err);
-                    context.delivery?.release();
-                  })
-                break;
-              case MessageType.cmdexe:
-                setCommandResult(queueDef, entity, deviceMessage.data)
-                  .then(() => {
-                    logger.debug('sent command result: %o', deviceMessage.data);
-                    context.delivery?.accept();
-                  })
-                  .catch((err) => {
-                    logger.error('failed sending command result', err);
-                    context.delivery?.release();
-                  })
-                break;
-              default:
-                logger.warn('unexpected message type', deviceMessage.messageType && MessageType[deviceMessage.messageType]);
-                context.delivery?.reject();
+            if (queueDef.backend === BackendType.iotagent) {
+              this.sendMessageToIotAgent(queueDef, context, msg);
+            } else {
+              this.sendMessageToOrion(queueDef, context, msg);
             }
           }
         } catch (err) {
@@ -231,6 +177,52 @@ export class Consumer extends AMQPBase {
     if (message.body && message.body.content) return message.body.content.toString("utf-8");
     if (message.body && Buffer.isBuffer(message.body)) return message.body.toString("utf-8");
     throw new Error('Unknown message format');
+  }
+
+  private sendMessageToIotAgent(queueDef: QueueDef, context: EventContext, message: string) {
+    const deviceMessage = new DeviceMessage(message);
+    const entity = (upstreamDataModel === 'dm-by-entity-type') ? Entity.fromData(queueDef, deviceMessage.data)
+                                                               : new Entity(queueDef.type, queueDef.id);
+    switch (deviceMessage.messageType) {
+      case MessageType.attrs:
+        sendAttributes(queueDef, entity, deviceMessage.data)
+          .then(() => {
+            logger.debug('sent attributes: %o', deviceMessage.data);
+            context.delivery?.accept();
+          })
+          .catch((err) => {
+            logger.error('failed sending attributes', err);
+            context.delivery?.release();
+          })
+        break;
+      case MessageType.cmdexe:
+        setCommandResult(queueDef, entity, deviceMessage.data)
+          .then(() => {
+            logger.debug('sent command result: %o', deviceMessage.data);
+            context.delivery?.accept();
+          })
+          .catch((err) => {
+            logger.error('failed sending command result', err);
+            context.delivery?.release();
+          })
+        break;
+      default:
+        logger.warn('unexpected message type', deviceMessage.messageType && MessageType[deviceMessage.messageType]);
+        context.delivery?.reject();
+    }
+  }
+
+  private sendMessageToOrion(queueDef: QueueDef, context: EventContext, message: string) {
+    const rawJson = JSON.parse(message);
+    sendNgsiMessage(queueDef, rawJson)
+      .then(() => {
+        logger.debug('sent ngsi message: %s', message);
+        context.delivery?.accept();
+      })
+      .catch((err) => {
+        logger.error('failed sending nsgi message', err);
+        context.delivery?.release();
+      })
   }
 }
 

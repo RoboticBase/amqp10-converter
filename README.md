@@ -1,11 +1,11 @@
 # amqp10-converter
-A protocol converter for AMQP 1.0 and FIWARE IoT Agent JSON.
+A protocol converter for AMQP 1.0 and FIWARE IoT Agent JSON or AMQP 1.0 and FIWARE Orion.
 
 [![Docker badge](https://img.shields.io/docker/pulls/roboticbase/amqp10-converter.svg)](https://hub.docker.com/r/roboticbase/amqp10-converter/)
 [![TravisCI Status](https://travis-ci.org/RoboticBase/amqp10-converter.svg?branch=master)](https://travis-ci.org/RoboticBase/amqp10-converter/)
 
 ## Description
-This converter is designed to be a bridge between [AMQP 1.0](http://www.amqp.org/sites/amqp.org/files/amqp.pdf) and [FIWARE IoTAgent JSON](https://github.com/telefonicaid/iotagent-json). This converter has been confirmed to be able to connect with the following Cloud-Managed Services or OSS:
+This converter is designed to be a bridge between [AMQP 1.0](http://www.amqp.org/sites/amqp.org/files/amqp.pdf) and [FIWARE IoTAgent JSON](https://github.com/telefonicaid/iotagent-json). Also supported bridge between [AMQP 1.0](http://www.amqp.org/sites/amqp.org/files/amqp.pdf) and [FIWARE Orion](https://github.com/telefonicaid/fiware-orion). This converter has been confirmed to be able to connect with the following Cloud-Managed Services or OSS:
 * [Microsoft Azure ServiceBus](https://azure.microsoft.com/en-us/services/service-bus/)
 * [AWS Amazon MQ](https://aws.amazon.com/amazon-mq/)
 * [Apache ActiveMQ classic](http://activemq.apache.org/components/classic/) 5.15.9
@@ -25,9 +25,11 @@ An example is available to try this converter using docker-compose. Please see [
 
 ## Naming and Formatting
 ### Endpoint
-The endpoint listening the POST request from IoTAgent JSON is like this: `http://<host>:<port>/<basePath>/cmd/<entityType>/<entityId>`.
+When you use iotagent backend, The endpoint listening the POST request from IoTAgent JSON is like this: `http://<host>:<port>/<basePath>/cmd/<entityType>/<entityId>`.
 
 The default value of `<basePath>` is "/amqp10", but you can change this by using `BASE_PATH` environment variable if you want.
+
+When you use orion backend, The endpoint listening the POST request from Orion is like this: `http://<host>:<port>/<ngsiVersion>/entities` and the PATCH request from Orion is like this: `http://<host>:<port>/<ngsiVersion>/entities/<entityId>`.
 
 ### Queue Name
 This converter requires two or more Queues: the one is **Upstream Queue** and the other is **Downstream Queue**.
@@ -75,6 +77,15 @@ The following table shows some example of the Downstream Queue Name:
 |`fs`|`/fsp`|`true`|`[{"type":"type0","id":"id0"}]`|`fs.fsp.type0.id0.down`|
 |`fs`|`/fsp`|`true`|`[{"type":"type0","id":"id0","fiwareService":"demo","fiwareServicePath":"/demo/path"}]`|`demo.demo-path.type0.id0.down`|
 
+#### Backend
+The following table shows some example of the backend service:
+
+|`QUEUE_DEFS`|Backend service|Related environment variables|
+|:--|:--|:--|
+|`[{"type":"type0","id":"id0"}]`|[FIWARE IoTAgent JSON](https://github.com/telefonicaid/iotagent-json) (default)|`IOTA_HOST`, `IOTA_MANAGE_PORT`, `IOTA_DATA_PORT`|
+|`[{"type":"type0","id":"id0","backend":"iotagent"}]`|[FIWARE IoTAgent JSON](https://github.com/telefonicaid/iotagent-json)|`IOTA_HOST`, `IOTA_MANAGE_PORT`, `IOTA_DATA_PORT`|
+|`[{"type":"type0","id":"id0","backend":"orion"}]`|[FIWARE Orion](https://github.com/telefonicaid/fiware-orion)|`IOTA_CB_HOST`, `IOTA_CB_PORT`, `IOTA_CB_NGSI_VERSION`|
+
 ### Message Format
 This converter requires the following message format:
 
@@ -87,7 +98,7 @@ This converter requires the following message format:
 The `<stringified JSON payload>` depends on the type of message.
 
 #### Upstream Queue
-The Upstream Queue is used to send `attrs` or `cmdexe` messages from device to FIWARE.
+When you use iotagent backend, The Upstream Queue is used to send `attrs` or `cmdexe` messages from device to FIWARE.
 
 * the `<JSON payload>` of `attrs` message which should be stringified
 
@@ -148,8 +159,22 @@ The default key of `entityId` is `__id`, but you can change this key name by usi
         }
         ```
 
+When you use orion backend, received NGSI message will be send to orion directly.
+
+* example:
+    ```json
+    {
+      "id": "urn:ngsi-ld:entity_type:id0",
+      "type": "vehicle_location",
+      "temperature": {
+        "type": "Numeric",
+        "value": 25.4
+      }
+    }
+    ```
+
 #### Downstream Queue
-The Downstream Queue is used to send `cmd` message from FIWARE to device.
+When you use iotagent backend, The Downstream Queue is used to send `cmd` message from FIWARE to device.
 
 * the `<JSON payload>` of `cmd` message which should be stringified
 
@@ -186,22 +211,6 @@ If you want to validate upstream messages, please follow below steps:
 This converter will try to validate an arrived upstream message from the beginning of the given json shcema array. This process will stop at the first successful validation, and in which case the arrived upstream message is judged as VALID. Unfortunately if all validations fail, the arrived upstream message is rejected and all following processes are skipped.  
 Therefore, if a ton of json schemas are given, they can cause the negative impact of performance.
 
-## Convert the message format
-You can convert the upstream messages to your desired format by using a [LiquidJS](https://liquidjs.com/) template.  
-If you want to convert upstream messages, please foloow below steps:
-
-1. create a LiquidJS template.
-1. copy the template to a directory which is accessible from `amqp10-converter`.
-1. set the file path for each queue to an environment variable `MAPPING_PATHS` like below:
-
-    ```
-    $ export MAPPING_PATHS='{"fs.fsp.type0.up":"/opt/templates/upstream.liquid"]}'
-    ```
-1. start `amqp10-converter`.
-
-**CAUTION!**
-The received message will be converted **after** validating it.
-
 ## Requirements
 
 * [node](https://nodejs.org/en/) 12.16 or higher
@@ -209,7 +218,6 @@ The received message will be converted **after** validating it.
 * [express](https://www.npmjs.com/package/express) 4.17.1
 * [rhea-promise](https://www.npmjs.com/package/rhea-promise) 1.0.0
 * [ajv](https://ajv.js.org/) 6.12.3
-* [liquidjs](https://liquidjs.com/) 9.15.0
 * [log4js](https://www.npmjs.com/package/log4js) 6.2.1
 * [iotagent-node-lib](https://www.npmjs.com/package/iotagent-node-lib) 2.12.0
 
@@ -234,7 +242,6 @@ This converter requires some environment variables like below:
 |`FIWARE_SERVICEPATH`|default fiware servicepath of IoT device|YES|/|
 |`QUEUE_DEFS`|the list of queue name definition|YES|[{"type":"type0","id":"id0"}]|
 |`SCHEMA_PATHS`|the list of json schema filepath|NO|{}|
-|`MAPPING_PATHS`|the list of json schema filepath|NO|{}|
 |`UPSTREAM_DATA_MODEL`|if "dm-by-entity", the entity Id is included in the Queue Name. if "dm-by-entity-type", the entity Id is not included in the Queue Name.|NO|dm-by-entity|
 |`USE_FULLY_QUALIFIED_QUEUE_NAME`|if "true", FIWARE-SERVICE and FIWARE-SERVICEPATH are included in the Queue Name|NO||
 |`ID_ATTR_NAME`|the key name of entityId included in the message body|NO|\_\_id|
